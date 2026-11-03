@@ -1,102 +1,248 @@
+
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const fs = require('fs');
 
 puppeteer.use(StealthPlugin());
 
-(async () => {
-    console.log("🔥 [GITHUB ACTIONS] The Master Database Builder has awakened...");
+const IDS_FILE = 'all_35k_ids.json';
+const DB_FILE = 'master_database.json';
 
-    const allIds = JSON.parse(fs.readFileSync('all_35k_ids.json', 'utf8'));
-    let database = [];
-    let completedIds = new Set();
-    
-    if (fs.existsSync('master_database.json')) {
-        try {
-            database = JSON.parse(fs.readFileSync('master_database.json', 'utf8'));
-            database.forEach(card => completedIds.add(card.id));
-            console.log(`📦 Resuming! Already finished ${completedIds.size} cards.`);
-        } catch(e) {}
-    }
+const BATCH_LIMIT = 8000;
+const CONCURRENCY = 8;
+const MAX_RETRIES = 2;
 
-    const pendingIds = allIds.filter(id => !completedIds.has(id));
-    console.log(`🚀 Remaining cards to scrape: ${pendingIds.length}`);
+function saveDatabase(database) {
+    const tempFile = DB_FILE + '.tmp';
+    fs.writeFileSync(tempFile, JSON.stringify(database, null, 2));
+    fs.renameSync(tempFile, DB_FILE);
+}
 
-    if (pendingIds.length === 0) {
-        console.log("🎉 DATABASE IS 100% COMPLETE!");
-        process.exit();
-    }
+function normalizeId(item) {
+    const value = typeof item === 'object' && item !== null
+        ? item.id ?? item.card_id
+        : item;
 
-    // 🔥 LIMIT TO 2000 PER RUN SO GITHUB CAN SAVE SAFELY!
-    const BATCH_LIMIT = Math.min(pendingIds.length, 8000);
-    const targetIds = pendingIds.slice(0, BATCH_LIMIT);
+    return value == null ? '' : String(value).trim();
+}
 
-    const browser = await puppeteer.launch({
-        headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-    });
+async function scrapeCard(browser, id) {
+    const page = await browser.newPage();
 
-    const CONCURRENCY = 20; // GitHub servers have 7GB RAM! We can do 10 tabs safely.
+    try {
+        await page.setRequestInterception(true);
 
-    for (let i = 0; i < targetIds.length; i += CONCURRENCY) {
-        let promises = [];
-        let batchData = [];
+        page.on('request', req => {
+            if (['image', 'media', 'font'].includes(req.resourceType())) {
+                return req.abort().catch(() => {});
+            }
+            req.continue().catch(() => {});
+        });
 
-        for (let j = 0; j < CONCURRENCY && (i + j) < targetIds.length; j++) {
-            const id = targetIds[i + j];
-            
-            promises.push((async () => {
-                const page = await browser.newPage();
-                await page.setRequestInterception(true);
-                page.on('request', (req) => {
-                    if (['image', 'media'].includes(req.resourceType())) req.abort();
-                    else req.continue();
-                });
+        const url = `https://shoob.gg/cards/info/${encodeURIComponent(id)}`;
 
-                try {
-                    const url = `https://shoob.gg/cards/info/${id}`;
-                    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-                    await page.waitForFunction(() => document.body && document.body.innerText.includes('Tier'), { timeout: 15000 }).catch(()=>{});
+        await page.goto(url, {
+            waitUntil: 'domcontentloaded',
+            timeout: 45000
+        });
 
-                    const cardData = await page.evaluate((cardId, cardUrl) => {
-                        let card = {
-                            id: cardId, name: "Unknown", tier: "Unknown", series: "Unknown", 
-                            maker: "Official", image: `https://api.shoob.gg/site/api/cardr/${cardId}?size=original`, url: cardUrl
-                        };
-                        let lines = document.body.innerText.split('\n').map(t => t.trim()).filter(t => t.length > 0);
-                        let tierLineIdx = lines.findIndex(l => l.match(/^Tier\s+[1-6S]$/i));
-                        if (tierLineIdx !== -1) {
-                            card.tier = lines[tierLineIdx].toUpperCase();
-                            let nextLines = lines.slice(tierLineIdx + 1, tierLineIdx + 10).filter(l => l !== '>');
-                            if (nextLines.length >= 2) {
-                                card.series = nextLines[0]; 
-                                card.name = nextLines[1];   
-                            }
-                        }
-                        let makerLine = lines.find(l => l.startsWith('Card Maker:'));
-                        if (makerLine) card.maker = makerLine.replace('Card Maker:', '').replace('See the Maker', '').trim();
-                        if (card.name === "Unknown") {
-                            let headerMatch = lines.find(l => l.match(/\-\s+T[1-6S]$/i)); 
-                            if (headerMatch) card.name = headerMatch.split('-')[0].trim();
-                        }
-                        return card;
-                    }, id, url);
+        await page.waitForFunction(
+            () => document.body &&
+                /Tier\s+[1-6S]/i.test(document.body.innerText),
+            { timeout: 12000 }
+        ).catch(() => {});
 
-                    batchData.push(cardData);
-                    console.log(`✅ [${cardData.name} | ${cardData.tier}]`);
-                } catch(e) {
-                    console.log(`⚠️ Skipped ID ${id}`);
-                } finally {
-                    await page.close();
+        const data = await page.evaluate((cardId, cardUrl) => {
+            const lines = document.body.innerText
+                .split('\n')
+                .map(x => x.trim())
+                .filter(Boolean);
+
+            const result = {
+                id: String(cardId),
+                name: 'Unknown',
+                tier: 'Unknown',
+                series: 'Unknown',
+                maker: 'Official',
+                image: `https://api.shoob.gg/site/api/cardr/${cardId}?size=original`,
+                url: cardUrl
+            };
+
+            const tierIndex = lines.findIndex(x =>
+                /^Tier\s+[1-6S]$/i.test(x)
+            );
+
+            if (tierIndex !== -1) {
+                result.tier = lines[tierIndex]
+                    .replace(/\s+/g, ' ')
+                    .toUpperCase();
+
+                const next = lines
+                    .slice(tierIndex + 1, tierIndex + 12)
+                    .filter(x => x !== '>');
+
+                if (next.length >= 2) {
+                    result.series = next[0];
+                    result.name = next[1];
                 }
-            })());
+            }
+
+            const maker = lines.find(x =>
+                x.toLowerCase().startsWith('card maker:')
+            );
+
+            if (maker) {
+                result.maker = maker
+                    .replace(/Card Maker:/i, '')
+                    .replace(/See the Maker/i, '')
+                    .trim() || 'Official';
+            }
+
+            if (result.name === 'Unknown') {
+                const title = document.title || '';
+
+                if (title) {
+                    result.name = title
+                        .replace(/\s*[-|]\s*Shoob.*$/i, '')
+                        .trim() || 'Unknown';
+                }
+            }
+
+            return result;
+        }, id, url);
+
+        if (data.tier === 'Unknown' && data.name === 'Unknown') {
+            throw new Error('Card information not found');
         }
 
-        await Promise.all(promises);
-        batchData.forEach(card => database.push(card));
-        fs.writeFileSync('master_database.json', JSON.stringify(database, null, 2));
-    }
+        return data;
 
-    console.log(`\n🏆 BATCH COMPLETE! Action will now save to GitHub!`);
-    await browser.close();
+    } finally {
+        await page.close().catch(() => {});
+    }
+}
+
+(async () => {
+    let browser;
+
+    try {
+        console.log('\n🔥 SHOOB MASTER DATABASE BUILDER');
+        console.log('================================\n');
+
+        if (!fs.existsSync(IDS_FILE)) {
+            throw new Error(`${IDS_FILE} not found`);
+        }
+
+        const rawIds = JSON.parse(fs.readFileSync(IDS_FILE, 'utf8'));
+
+        if (!Array.isArray(rawIds)) {
+            throw new Error('IDs file must contain a JSON array');
+        }
+
+        const allIds = [...new Set(rawIds.map(normalizeId).filter(Boolean))];
+
+        let database = [];
+
+        if (fs.existsSync(DB_FILE)) {
+            try {
+                database = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+
+                if (!Array.isArray(database)) {
+                    database = [];
+                }
+            } catch {
+                console.log('⚠️ Existing database is invalid. Starting fresh.');
+                database = [];
+            }
+        }
+
+        const completedIds = new Set(
+            database.map(card => String(card.id ?? card.card_id))
+        );
+
+        const pendingIds = allIds.filter(id => !completedIds.has(id));
+
+        console.log(`📦 Total IDs: ${allIds.length}`);
+        console.log(`✅ Already scraped: ${completedIds.size}`);
+
+        const targetIds = pendingIds.slice(0, BATCH_LIMIT);
+
+        console.log(`🚀 This run: ${targetIds.length}`);
+        console.log(`⏳ Remaining after this batch: ${Math.max(0, pendingIds.length - targetIds.length)}\n`);
+
+        if (!targetIds.length) {
+            console.log('🎉 DATABASE IS COMPLETE!');
+            return;
+        }
+
+        browser = await puppeteer.launch({
+            headless: true,
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage'
+            ]
+        });
+
+        let success = 0;
+        let failed = 0;
+
+        for (let i = 0; i < targetIds.length; i += CONCURRENCY) {
+            const batch = targetIds.slice(i, i + CONCURRENCY);
+
+            const results = await Promise.all(
+                batch.map(async id => {
+                    for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt++) {
+                        try {
+                            const card = await scrapeCard(browser, id);
+
+                            console.log(
+                                `✅ ${card.id} | ${card.name} | ${card.tier} | ${card.series}`
+                            );
+
+                            return card;
+                        } catch (error) {
+                            if (attempt <= MAX_RETRIES) {
+                                console.log(`🔄 Retry ${attempt}: ${id}`);
+                            } else {
+                                console.log(`❌ Failed: ${id} | ${error.message}`);
+                            }
+                        }
+                    }
+
+                    return null;
+                })
+            );
+
+            for (const card of results) {
+                if (card) {
+                    database.push(card);
+                    completedIds.add(card.id);
+                    success++;
+                } else {
+                    failed++;
+                }
+            }
+
+            saveDatabase(database);
+
+            console.log(
+                `\n📊 Progress: ${Math.min(i + batch.length, targetIds.length)}/${targetIds.length}` +
+                ` | Success: ${success} | Failed: ${failed} | Database: ${database.length}\n`
+            );
+        }
+
+        console.log('\n================================');
+        console.log('🏆 BATCH COMPLETED');
+        console.log(`✅ Successful: ${success}`);
+        console.log(`❌ Failed: ${failed}`);
+        console.log(`📦 Total database cards: ${database.length}`);
+        console.log('💾 Database saved successfully.');
+
+    } catch (error) {
+        console.error('🔥 SCRAPER ERROR:', error);
+        process.exitCode = 1;
+    } finally {
+        if (browser) await browser.close().catch(() => {});
+    }
 })();
